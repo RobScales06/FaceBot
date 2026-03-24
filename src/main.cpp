@@ -22,6 +22,15 @@ float faceVelX = 0, faceVelY = 0;
 float gyroPush = 1.9f;    // how strongly rotation pushes the face
 float springBack = 0.08f; // pull back toward center
 float damping = 0.84f;    // motion decay per frame
+bool easeBackToCenter = true; // Set to false to disable spring back
+bool rotateWithMotion = true; // Set to false to disable face rotation with motion
+bool easeRotateBackToCenter = true; // Set to false to disable angular spring back
+float faceAngle = 0.0f;       // face rotation angle in radians
+float faceAngVel = 0.0f;      // angular velocity in radians/frame
+float gyroRotatePush = 0.008f; // how strongly gyro Z pushes face rotation
+float angleSpringBack = 0.06f;
+float angleDamping = 0.86f;
+float maxFaceAngle = 0.50f;   // ~28.6 degrees
 unsigned long lastGyroPrintMs = 0;
 
 void scanI2CBus(TwoWire &bus, const char *label) {
@@ -141,6 +150,16 @@ Point lerp(Point a, Point b, float t) {
   return { a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t };
 }
 
+// Rotate a local point (around origin) by angle in radians
+Point rotatePoint(Point p, float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return {
+    p.x * c - p.y * s,
+    p.x * s + p.y * c
+  };
+}
+
 // Blend between two shape arrays (8 points each) by factor x (0 to 1)
 // Writes result to destAnchors. Transitions from shapeA (x=0) to shapeB (x=1)
 void blendShapesInto(Point shapeA[8], Point shapeB[8], Point destAnchors[8], float x) {
@@ -164,9 +183,10 @@ Point cubicBezier(Point p0, Point c0, Point c1, Point p1, float t) {
 
 // Update mouth anchor points and control points for smooth curve
 void updateMouth() {
-  // Recalculate mouth position from face center
-  mouthCx = faceCx + mouthOffsetX;
-  mouthCy = faceCy + mouthOffsetY;
+  // Recalculate mouth position from face center (with face rotation)
+  Point mouthOffsetRot = rotatePoint({mouthOffsetX, mouthOffsetY}, faceAngle);
+  mouthCx = faceCx + mouthOffsetRot.x;
+  mouthCy = faceCy + mouthOffsetRot.y;
 
 //   // Morph from shapeA -> shapeB -> shapeC by time. This is your keyframe blending.
 //   float phase = (sin(tAnim * 0.7f) + 1.0f) / 2.0f; // [0,1]
@@ -189,9 +209,9 @@ void updateMouth() {
   
   // Offset blend result to screen position and store in anchors
   for (int i = 0; i < 8; i++) {
-    anchors[i] = blended[i];
-    anchors[i].x += mouthCx;
-    anchors[i].y += mouthCy;
+    Point p = rotatePoint(blended[i], faceAngle);
+    anchors[i].x = p.x + mouthCx;
+    anchors[i].y = p.y + mouthCy;
   }
 
   // Convert anchors into control points for smooth cubic segments.
@@ -218,10 +238,12 @@ void updateMouth() {
 // Applies blending between two eye shapes and generates control points
 void updateEyes() {
   // Recalculate eye positions from face center
-  eyeLcx = faceCx + eyeLeftOffsetX;
-  eyeLcy = faceCy + eyeLeftOffsetY;
-  eyeRcx = faceCx + eyeRightOffsetX;
-  eyeRcy = faceCy + eyeRightOffsetY;
+  Point eyeLOffsetRot = rotatePoint({eyeLeftOffsetX, eyeLeftOffsetY}, faceAngle);
+  Point eyeROffsetRot = rotatePoint({eyeRightOffsetX, eyeRightOffsetY}, faceAngle);
+  eyeLcx = faceCx + eyeLOffsetRot.x;
+  eyeLcy = faceCy + eyeLOffsetRot.y;
+  eyeRcx = faceCx + eyeROffsetRot.x;
+  eyeRcy = faceCy + eyeROffsetRot.y;
 
   // Blink cycle: 3 seconds total
   // Eyes stay open for 2.7 seconds, then blink (close/open) for 0.3 seconds
@@ -247,13 +269,13 @@ void updateEyes() {
   
   // Offset blend results to screen positions and store in anchor arrays
   for (int i = 0; i < 8; i++) {
-    eyeAnchorsL[i] = blendedL[i];
-    eyeAnchorsL[i].x += eyeLcx;
-    eyeAnchorsL[i].y += eyeLcy;
+    Point leftP = rotatePoint(blendedL[i], faceAngle);
+    eyeAnchorsL[i].x = leftP.x + eyeLcx;
+    eyeAnchorsL[i].y = leftP.y + eyeLcy;
     
-    eyeAnchorsR[i] = blendedR[i];
-    eyeAnchorsR[i].x += eyeRcx;
-    eyeAnchorsR[i].y += eyeRcy;
+    Point rightP = rotatePoint(blendedR[i], faceAngle);
+    eyeAnchorsR[i].x = rightP.x + eyeRcx;
+    eyeAnchorsR[i].y = rightP.y + eyeRcy;
   }
 
   // Generate control points for left eye
@@ -505,13 +527,31 @@ void loop() {
   faceVelX += (-gyroX) * gyroPush;
   faceVelY += ( gyroY) * gyroPush;
 
+  // Rotate face around center from gyro Z (toggle-able)
+  if (rotateWithMotion) {
+    faceAngVel += (-gyroZ) * gyroRotatePush;
+    if (easeRotateBackToCenter) {
+      faceAngVel += (-faceAngle) * angleSpringBack;
+    }
+    faceAngVel *= angleDamping;
+    faceAngle += faceAngVel;
+  } else {
+    faceAngle = 0.0f;
+    faceAngVel = 0.0f;
+  }
+
+  if (faceAngle < -maxFaceAngle) faceAngle = -maxFaceAngle;
+  if (faceAngle >  maxFaceAngle) faceAngle =  maxFaceAngle;
+
   // Spring/damper so face naturally returns to center when rotation stops
-  faceVelX += (-faceOffsetX) * springBack;
-  faceVelY += (-faceOffsetY) * springBack;
-  faceVelX *= damping;
-  faceVelY *= damping;
-  faceOffsetX += faceVelX;
-  faceOffsetY += faceVelY;
+  if (easeBackToCenter) {
+    faceVelX += (-faceOffsetX) * springBack;
+    faceVelY += (-faceOffsetY) * springBack;
+    faceVelX *= damping;
+    faceVelY *= damping;
+    faceOffsetX += faceVelX;
+    faceOffsetY += faceVelY;
+  }
 
   // Limit how far the face can move from center
   if (faceOffsetX < -40) faceOffsetX = -40;
