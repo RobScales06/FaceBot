@@ -33,6 +33,16 @@ float angleDamping = 0.86f;
 float maxFaceAngle = 0.50f;   // ~28.6 degrees
 unsigned long lastGyroPrintMs = 0;
 
+const int buzzerPin = 27;
+const int buzzerChannel = 0;
+const int buzzerResolution = 8;
+
+void playStartupBeep() {
+  ledcWriteTone(buzzerChannel, 1800);
+  delay(80);
+  ledcWriteTone(buzzerChannel, 0);
+}
+
 void scanI2CBus(TwoWire &bus, const char *label) {
   Serial.print("I2C scan on ");
   Serial.print(label);
@@ -444,6 +454,10 @@ void setup() {
   Serial.begin(115200);
   delay(1000); // Allow MPU6050 power-up time (needs ~30ms min, more is safer)
   Serial.println("Booting...");
+
+  ledcSetup(buzzerChannel, 2000, buzzerResolution);
+  ledcAttachPin(buzzerPin, buzzerChannel);
+  playStartupBeep();
 
   // OLED on Wire (SDA=21, SCL=22), MPU6050 on Wire1 (SDA=25, SCL=26)
   Wire.begin(21, 22);
