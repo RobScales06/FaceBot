@@ -132,6 +132,10 @@ boolean isCharacterSpace(char c) {
   return c == ' ';
 }
 
+boolean isPlayingNotes() {
+  return charBeepToneOn || speechEventCount > 0;
+}
+
 void serviceCharBeeps() {
   if (activeSpeechEvent == '\0' && speechEventCount <= 0) {
     charBeepInGap = false;
@@ -408,7 +412,12 @@ void updateMouth() {
 //     blendShapesInto(closed, smile, anchors, x);
 //   }
 
-  float phase = (sin(tAnim * 20.0f) + 1.0f) / 2.0f;  // oscillates between 0 and 1
+  float phase;
+  if (isPlayingNotes()) {
+    phase = (sin(tAnim * 20.0f) + 1.0f) / 2.0f;  // animate when playing notes
+  } else {
+    phase = 0.05f;  // blend almost completely closed when silent
+  }
   
   // Temporary array for blended mouth shape (in local coordinates)
   Point blended[8];
