@@ -1,6 +1,8 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 // OLED display size for SSD1306 module
 #define SCREEN_WIDTH 128
@@ -8,6 +10,37 @@
 
 // Create display object using I2C (Wire)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// MPU6050 object (default I2C address 0x68)
+Adafruit_MPU6050 mpu;
+bool mpuReady = false;
+float gyroX = 0, gyroY = 0, gyroZ = 0;
+float filteredX = 0, filteredY = 0;
+float lagFactor = 0.08f; // Lower = more lag
+float faceOffsetX = 0, faceOffsetY = 0;
+float faceVelX = 0, faceVelY = 0;
+float gyroPush = 1.9f;    // how strongly rotation pushes the face
+float springBack = 0.08f; // pull back toward center
+float damping = 0.84f;    // motion decay per frame
+unsigned long lastGyroPrintMs = 0;
+
+void scanI2CBus(TwoWire &bus, const char *label) {
+  Serial.print("I2C scan on ");
+  Serial.print(label);
+  Serial.println("...");
+  int foundCount = 0;
+  for (uint8_t address = 1; address < 127; address++) {
+    bus.beginTransmission(address);
+    uint8_t error = bus.endTransmission();
+    if (error == 0) {
+      Serial.print("  device at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      foundCount++;
+    }
+  }
+  if (foundCount == 0) Serial.println("  No devices found.");
+}
 
 // Simple 2D point type for mouth vertices and Bézier control points
 struct Point { float x, y; };
@@ -386,16 +419,123 @@ void fillMouthPoly() {
 }
 
 void setup() {
-  // Initialize I2C and OLED display
+  Serial.begin(115200);
+  delay(1000); // Allow MPU6050 power-up time (needs ~30ms min, more is safer)
+  Serial.println("Booting...");
+
+  // OLED on Wire (SDA=21, SCL=22), MPU6050 on Wire1 (SDA=25, SCL=26)
   Wire.begin(21, 22);
+  Wire.setClock(100000);
+  scanI2CBus(Wire, "Wire (SDA=21 SCL=22)");
+
+  pinMode(25, INPUT_PULLUP);
+  pinMode(26, INPUT_PULLUP);
+  Wire1.begin(25, 26);
+  Wire1.setClock(100000);
+  scanI2CBus(Wire1, "Wire1 (SDA=25 SCL=26)");
+
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
   display.display();
+
+  // Try to find MPU6050 up to 5 times with delays (handles slow power-up)
+  Serial.println("Looking for MPU6050...");
+  for (int attempt = 1; attempt <= 5 && !mpuReady; attempt++) {
+    Serial.print("Attempt ");
+    Serial.print(attempt);
+    Serial.print("/5... ");
+    if (mpu.begin(0x68, &Wire1)) {
+      mpuReady = true;
+      Serial.println("found at 0x68");
+    } else if (mpu.begin(0x69, &Wire1)) {
+      mpuReady = true;
+      Serial.println("found at 0x69");
+    } else {
+      Serial.println("not found");
+      delay(300);
+    }
+  }
+
+  if (!mpuReady) {
+    Serial.println("MPU6050 FAILED on Wire1 (SDA=25 SCL=26).");
+  }
+
+  if (mpuReady) {
+    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+  
+  // Set initial filtered values to face center
+  filteredX = faceCx;
+  filteredY = faceCy;
 }
 
 void loop() {
   // Step the animation phase
   tAnim += 0.06f;
+
+  // Read gyroscope data from MPU6050
+  if (mpuReady) {
+    sensors_event_t accelEvent, gyroEvent, tempEvent;
+    mpu.getEvent(&accelEvent, &gyroEvent, &tempEvent);
+    gyroX = gyroEvent.gyro.x; // rad/s
+    gyroY = gyroEvent.gyro.y; // rad/s
+    gyroZ = gyroEvent.gyro.z; // rad/s
+  } else {
+    gyroX = 0;
+    gyroY = 0;
+    gyroZ = 0;
+  }
+
+  // Print gyro values at 10 Hz for troubleshooting
+  if (millis() - lastGyroPrintMs >= 200) {
+    Serial.print("mpuReady=");
+    Serial.print(mpuReady ? 1 : 0);
+    Serial.print(" gyro(rad/s) x=");
+    Serial.print(gyroX, 5);
+    Serial.print(" y=");
+    Serial.print(gyroY, 5);
+    Serial.print(" z=");
+    Serial.println(gyroZ, 5);
+    lastGyroPrintMs = millis();
+  }
+
+  // Push face opposite of rotation direction (screen-space mapping)
+  faceVelX += (-gyroX) * gyroPush;
+  faceVelY += ( gyroY) * gyroPush;
+
+  // Spring/damper so face naturally returns to center when rotation stops
+  faceVelX += (-faceOffsetX) * springBack;
+  faceVelY += (-faceOffsetY) * springBack;
+  faceVelX *= damping;
+  faceVelY *= damping;
+  faceOffsetX += faceVelX;
+  faceOffsetY += faceVelY;
+
+  // Limit how far the face can move from center
+  if (faceOffsetX < -40) faceOffsetX = -40;
+  if (faceOffsetX >  40) faceOffsetX =  40;
+  if (faceOffsetY < -16) faceOffsetY = -16;
+  if (faceOffsetY >  16) faceOffsetY =  16;
+
+  // Target from gyro-driven offsets
+  float targetX = 64 + faceOffsetX;
+  float targetY = 40 + faceOffsetY;
+
+  // Clamp target position to screen bounds
+  if(targetX < 24) targetX = 24;
+  if(targetX > 104) targetX = 104;
+  if(targetY < 24) targetY = 24;
+  if(targetY > 56) targetY = 56;
+
+  // Lag filter: move filtered position toward target
+  filteredX += (targetX - filteredX) * lagFactor;
+  filteredY += (targetY - filteredY) * lagFactor;
+
+  // Set face center to lagged position
+  faceCx = filteredX;
+  faceCy = filteredY;
 
   // Recompute the mouth and eye positions for this frame
   updateMouth();
@@ -420,4 +560,5 @@ void loop() {
 
   delay(30); // near 33Hz update rate
 }
+
 
