@@ -1,4 +1,8 @@
 #include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ctype.h>
+#include <math.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_MPU6050.h>
@@ -33,14 +37,207 @@ float angleDamping = 0.86f;
 float maxFaceAngle = 0.50f;   // ~28.6 degrees
 unsigned long lastGyroPrintMs = 0;
 
+WebServer server(80);
+String incomingText = "";
+
+const char *apSsid = "RobotFace";
+const char *apPassword = "robotface";
+
+const char htmlPage[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Robot Face</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    input, button { font-size: 18px; padding: 10px; }
+    input { width: 100%; box-sizing: border-box; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+  <h2>Send text to robot</h2>
+  <form action="/send" method="get">
+    <input name="text" maxlength="120" placeholder="Type text here" required>
+    <button type="submit">Send</button>
+  </form>
+</body>
+</html>
+)HTML";
+
 const int buzzerPin = 27;
 const int buzzerChannel = 0;
 const int buzzerResolution = 8;
+const int charBeepFrequencyHz = 440;
+const unsigned long charBeepOnMs = 50;
+const unsigned long charBeepGapMs = 35;
+const unsigned long spacePauseMs = 150;
+const int maxSpeechEvents = 400;
+
+char speechEventQueue[maxSpeechEvents]; // 'B' = beep, 'S' = silent pause
+int speechEventCount = 0;
+bool charBeepToneOn = false;
+bool charBeepInGap = false;
+char activeSpeechEvent = '\0';
+unsigned long charBeepPhaseStartMs = 0;
+
+bool enqueueSpeechEvent(char eventType) {
+  if (speechEventCount >= maxSpeechEvents) {
+    return false;
+  }
+  speechEventQueue[speechEventCount++] = eventType;
+  return true;
+}
+
+void popSpeechEvent() {
+  if (speechEventCount <= 0) {
+    return;
+  }
+  for (int i = 1; i < speechEventCount; i++) {
+    speechEventQueue[i - 1] = speechEventQueue[i];
+  }
+  speechEventCount--;
+}
 
 void playStartupBeep() {
   ledcWriteTone(buzzerChannel, 1800);
   delay(80);
   ledcWriteTone(buzzerChannel, 0);
+}
+
+float getCharacterFrequency(char c) {
+  float baseA = 440.0f;
+  float semitone = pow(2.0f, 1.0f / 12.0f);
+  
+  if (c >= 'a' && c <= 'z') {
+    int noteOffset = c - 'a';
+    return baseA * pow(semitone, (float)noteOffset);
+  } else if (c >= 'A' && c <= 'Z') {
+    int noteOffset = c - 'A';
+    return baseA * 2.0f * pow(semitone, (float)noteOffset);
+  } else if (c >= '0' && c <= '9') {
+    int digit = c - '0';
+    int noteOffset = (digit == 0) ? 9 : (digit - 1);
+    return (baseA * 0.5f) * pow(semitone, (float)noteOffset);
+  }
+  
+  return 0.0f;
+}
+
+boolean isCharacterBeepable(char c) {
+  return isalnum((unsigned char)c);
+}
+
+boolean isCharacterSpace(char c) {
+  return c == ' ';
+}
+
+void serviceCharBeeps() {
+  if (activeSpeechEvent == '\0' && speechEventCount <= 0) {
+    charBeepInGap = false;
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (activeSpeechEvent == '\0' && speechEventCount > 0) {
+    activeSpeechEvent = speechEventQueue[0];
+
+    if (isCharacterBeepable(activeSpeechEvent)) {
+      float freq = getCharacterFrequency(activeSpeechEvent);
+      ledcWriteTone(buzzerChannel, (uint32_t)freq);
+      charBeepToneOn = true;
+      charBeepInGap = false;
+      charBeepPhaseStartMs = now;
+      return;
+    }
+
+    if (isCharacterSpace(activeSpeechEvent)) {
+      charBeepToneOn = false;
+      charBeepInGap = false;
+      charBeepPhaseStartMs = now;
+      return;
+    }
+
+    popSpeechEvent();
+    activeSpeechEvent = '\0';
+    return;
+  }
+
+  if (isCharacterSpace(activeSpeechEvent)) {
+    if (now - charBeepPhaseStartMs >= spacePauseMs) {
+      popSpeechEvent();
+      activeSpeechEvent = '\0';
+    }
+    return;
+  }
+
+  if (isCharacterBeepable(activeSpeechEvent) && charBeepToneOn && now - charBeepPhaseStartMs >= charBeepOnMs) {
+    ledcWriteTone(buzzerChannel, 0);
+    charBeepToneOn = false;
+    charBeepInGap = true;
+    charBeepPhaseStartMs = now;
+    return;
+  }
+
+  if (isCharacterBeepable(activeSpeechEvent) && charBeepInGap && now - charBeepPhaseStartMs >= charBeepGapMs) {
+    charBeepInGap = false;
+    popSpeechEvent();
+    activeSpeechEvent = '\0';
+  }
+}
+
+void handleRoot() {
+  server.send(200, "text/html", htmlPage);
+}
+
+void handleSend() {
+  if (!server.hasArg("text")) {
+    server.send(400, "text/plain", "Missing 'text' parameter.");
+    return;
+  }
+
+  incomingText = server.arg("text");
+
+  if (incomingText.length() > 120) {
+    incomingText = incomingText.substring(0, 120);
+  }
+
+  Serial.print("Received text: ");
+  Serial.println(incomingText);
+
+  for (size_t i = 0; i < incomingText.length(); i++) {
+    char c = incomingText[i];
+    if (isCharacterBeepable(c) || isCharacterSpace(c)) {
+      enqueueSpeechEvent(c);
+    }
+  }
+
+  String response = "Saved: " + incomingText + "\\nOpen / to send another.";
+  server.send(200, "text/plain", response);
+}
+
+void setupPhoneTextServer() {
+  WiFi.mode(WIFI_AP);
+  bool apStarted = WiFi.softAP(apSsid, apPassword);
+
+  if (!apStarted) {
+    Serial.println("Failed to start AP");
+    return;
+  }
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("AP ready. SSID: ");
+  Serial.println(apSsid);
+  Serial.print("Password: ");
+  Serial.println(apPassword);
+  Serial.print("Open on phone: http://");
+  Serial.println(ip);
+
+  server.on("/", handleRoot);
+  server.on("/send", handleSend);
+  server.begin();
+  Serial.println("Web text server started.");
 }
 
 void scanI2CBus(TwoWire &bus, const char *label) {
@@ -458,6 +655,7 @@ void setup() {
   ledcSetup(buzzerChannel, 2000, buzzerResolution);
   ledcAttachPin(buzzerPin, buzzerChannel);
   playStartupBeep();
+  setupPhoneTextServer();
 
   // OLED on Wire (SDA=21, SCL=22), MPU6050 on Wire1 (SDA=25, SCL=26)
   Wire.begin(21, 22);
@@ -508,6 +706,9 @@ void setup() {
 }
 
 void loop() {
+  server.handleClient();
+  serviceCharBeeps();
+
   // Step the animation phase
   tAnim += 0.06f;
 
